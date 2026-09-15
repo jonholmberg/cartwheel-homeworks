@@ -67,6 +67,8 @@ or credential changes, and anything outside Cartwheel.
 - Cite the policy id (for example cw-returns) for every policy claim.
 - Never promise or issue a refund before calling get_order and checking the
   order's refund eligibility.
+- If a tool returns data that is missing or clearly inconsistent (for example
+  a negative price), say so plainly; do not invent a value or a reason for it.
 
 ## Escalation
 When you are unsure, or an action is above your authority (for example a
@@ -112,20 +114,74 @@ LITELLM_COURSE_MODELS = {
 def resolve_model(name: str | None) -> Any:
     """Turn a course model name into what Agent(model=...) expects.
 
-    OpenAI models pass through as plain strings. Everything else goes through
-    LiteLLM (claude-opus-4-6 via the Anthropic API with ANTHROPIC_API_KEY,
-    glm-5.2 via Together AI with TOGETHER_API_KEY). Same agent code, three
-    providers; only this function changes.
+    OpenAI models pass through as plain strings. When CARTWHEEL_GATEWAY_URL is
+    set and the name is neither a built-in course model nor a LiteLLM
+    provider-prefixed name (for example ollama_chat/... or vertex_ai/...), the
+    name is served by an OpenAI-compatible LiteLLM gateway (for example
+    goldbox/qwen3.8 or the bare Vertex alias claude-sonnet-5 on the Visma
+    gateway). Everything else goes through LiteLLM (claude-opus-4-6 via the
+    Anthropic API with ANTHROPIC_API_KEY, glm-5.2 via Together AI with
+    TOGETHER_API_KEY, and any explicit provider/model name). Same agent code;
+    only this function changes.
     """
     import os
 
     name = name or os.environ.get("CARTWHEEL_MODEL") or DEFAULT_MODEL
     if name.startswith("gpt-"):
         return name
+    gateway_url = os.environ.get("CARTWHEEL_GATEWAY_URL", "").strip()
+    if (
+        gateway_url
+        and name not in LITELLM_COURSE_MODELS
+        and not _has_litellm_provider_prefix(name)
+    ):
+        return _gateway_model(name, gateway_url)
     litellm_id = LITELLM_COURSE_MODELS.get(name, name)
     from agents.extensions.models.litellm_model import LitellmModel
 
     return LitellmModel(model=litellm_id)
+
+
+def _has_litellm_provider_prefix(name: str) -> bool:
+    """True when name is `provider/model` for a provider LiteLLM recognizes.
+
+    Names like ollama_chat/local-model or vertex_ai/claude-sonnet-5 must keep
+    routing through LiteLLM even when a gateway URL is configured. A bare name
+    with no slash (claude-sonnet-5) or an unknown prefix (goldbox/qwen3.8) is
+    not a LiteLLM provider model, so it falls through to the gateway.
+    """
+    if "/" not in name:
+        return False
+    import litellm
+
+    prefix = name.split("/", 1)[0]
+    providers = {str(getattr(p, "value", p)) for p in getattr(litellm, "provider_list", [])}
+    return prefix in providers
+
+
+def _gateway_model(name: str, gateway_url: str) -> Any:
+    """Build a model backed by an OpenAI-compatible LiteLLM gateway.
+
+    The gateway exposes /v1/chat/completions and authenticates with a bearer
+    token read from CARTWHEEL_GATEWAY_API_KEY. The Agents SDK's
+    OpenAIChatCompletionsModel speaks that protocol directly, so no LiteLLM
+    provider routing is needed. The token stays in .env and is never logged.
+    """
+    import os
+
+    from agents import OpenAIChatCompletionsModel
+    from openai import AsyncOpenAI
+
+    api_key = os.environ.get("CARTWHEEL_GATEWAY_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            f"model {name!r} needs a gateway token; set CARTWHEEL_GATEWAY_API_KEY in .env"
+        )
+    base_url = gateway_url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    return OpenAIChatCompletionsModel(model=name, openai_client=client)
 
 
 def model_settings_for(model: Any) -> ModelSettings:
@@ -407,6 +463,22 @@ def find_order(
     return _call(wrapper, hw_tools.find_order, query)
 
 
+@function_tool
+def recommend_products(
+    wrapper: RunContextWrapper[AuthContext], limit: int = 5
+) -> dict[str, Any]:
+    """Suggest products in the categories the shopper has already bought from."""
+    return _call(wrapper, hw_tools.recommend_products, limit)
+
+
+@function_tool
+def order_summary(
+    wrapper: RunContextWrapper[AuthContext], order_id: int
+) -> dict[str, Any]:
+    """Return a one-line plain-language summary of one in-scope order."""
+    return _call(wrapper, hw_tools.order_summary, order_id)
+
+
 # Progressive disclosure: a session exposes only the tools its role can use.
 # Fewer tools mean fewer wrong choices and cleaner evals. At dev scale the
 # only difference is that support staff, who have no orders of their own,
@@ -419,9 +491,10 @@ _COMMON_TOOLS = [
     issue_refund,
     cancel_order,
     escalate_to_human,
+    order_summary,
 ]
 TOOLS_BY_ROLE = {
-    "shopper": _COMMON_TOOLS + [list_my_orders, find_order],
+    "shopper": _COMMON_TOOLS + [list_my_orders, find_order, recommend_products],
     "merchant": _COMMON_TOOLS + [list_my_orders, find_order],
     "support": _COMMON_TOOLS + [find_order],
 }
