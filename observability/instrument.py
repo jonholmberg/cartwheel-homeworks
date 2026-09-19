@@ -87,6 +87,63 @@ def load_env(path: Path | None = None) -> None:
             os.environ.setdefault(key, value)
 
 
+def _parse_headers(raw: str) -> dict[str, str]:
+    """Parse a comma-separated `key=value` header string into a dict."""
+    headers: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if key:
+            headers[key] = value
+    return headers
+
+
+def add_mlflow_exporter(tracer_provider: Any) -> bool:
+    """Fan spans out to MLflow via OTLP/HTTP alongside the existing backend.
+
+    Opt-in and config-driven: a no-op unless CARTWHEEL_MLFLOW_OTLP_ENDPOINT is
+    set (for example http://localhost:5000/v1/traces). MLflow 3.6+ accepts OTLP
+    spans and reads the target experiment from the `x-mlflow-experiment-id`
+    header, supplied here via CARTWHEEL_MLFLOW_EXPERIMENT_ID. Extra headers
+    (auth for a managed MLflow) come from CARTWHEEL_MLFLOW_OTLP_HEADERS as a
+    comma-separated `key=value` list.
+
+    A separate BatchSpanProcessor is added to the already-registered provider,
+    so the same spans still reach Langfuse. Call this after instrument_genai so
+    the instrumentor's processor replacement does not drop it.
+    """
+    endpoint = os.environ.get("CARTWHEEL_MLFLOW_OTLP_ENDPOINT", "").strip()
+    if not endpoint:
+        return False
+    if not hasattr(tracer_provider, "add_span_processor"):
+        log.warning(
+            "MLflow export requested but the active tracer provider cannot "
+            "accept a span processor; skipping."
+        )
+        return False
+
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter,
+    )
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    headers: dict[str, str] = {}
+    experiment_id = os.environ.get("CARTWHEEL_MLFLOW_EXPERIMENT_ID", "").strip()
+    if experiment_id:
+        headers["x-mlflow-experiment-id"] = experiment_id
+    extra = os.environ.get("CARTWHEEL_MLFLOW_OTLP_HEADERS", "").strip()
+    if extra:
+        headers.update(_parse_headers(extra))
+
+    exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers or None)
+    tracer_provider.add_span_processor(BatchSpanProcessor(exporter))
+    log.info("MLflow dual-export enabled; spans also go to %s", endpoint)
+    return True
+
+
 def setup_tracing() -> bool:
     """Install Langfuse tracing; return False when credentials are missing."""
     load_env()
@@ -100,7 +157,11 @@ def setup_tracing() -> bool:
     from langfuse import get_client
 
     get_client()  # registers the OTel tracer provider from LANGFUSE_* env vars
-    instrument_genai(trace.get_tracer_provider())
+    provider = trace.get_tracer_provider()
+    instrument_genai(provider)
+    # Add MLflow after instrument_genai so the instrumentor's processor
+    # replacement does not drop the second exporter. No-op unless configured.
+    add_mlflow_exporter(provider)
     # Preserve processor replacement for callers such as the server, which
     # ignore our return value. A missing secret makes Langfuse a no-op client;
     # returning before replacement would leave hosted OpenAI export active.
@@ -122,10 +183,11 @@ def record_tool_result(ctx: "AuthContext", result: dict[str, Any]) -> None:
     span = trace.get_current_span()
     if not span.is_recording():
         return
-    ### YOUR CODE HERE (HW2)
-    raise NotImplementedError(
-        "HW2: add authenticated caller and permission attributes to the tool span"
-    )
+    span.set_attribute("cartwheel.user_role", ctx.role)
+    span.set_attribute("cartwheel.user_id", str(ctx.user_id))
+    if ctx.role == "merchant":
+        span.set_attribute("cartwheel.store_id", str(ctx.store_id))
+    _set_permission_denied_attributes(span, result)
 
 
 def _set_permission_denied_attributes(
@@ -149,5 +211,7 @@ def _set_permission_denied_attributes(
     the smoke report counts them and Module 3 asserts on them. This is the one place in the
     course where you touch instrumentation by hand.
     """
-    ### YOUR CODE HERE (HW2)
-    raise NotImplementedError("HW2: set the cartwheel.permission_denied span attribute")
+    denied = result.get("error") == "permission_denied"
+    span.set_attribute("cartwheel.permission_denied", denied)
+    if denied:
+        span.set_attribute("cartwheel.permission_denied.reason", result.get("reason", ""))
