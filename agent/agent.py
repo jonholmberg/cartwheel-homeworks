@@ -102,13 +102,16 @@ def prompt_version(template: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Models. Three course models; any other value is passed to LiteLLM as-is.
+# Models. Course models; any other value is passed to LiteLLM as-is.
+# The default is deliberately a small model. Frontier models rarely make
+# mistakes in this synthetic world, which leaves too few failures to study.
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 # Course model name -> LiteLLM model string (for the non-OpenAI models).
 LITELLM_COURSE_MODELS = {
+    "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
     "claude-opus-4-6": "anthropic/claude-opus-4-6",
     "glm-5.2": "together_ai/zai-org/GLM-5.2",
 }
@@ -196,12 +199,15 @@ def model_settings_for(model: Any) -> ModelSettings:
     documents is passing `allowed_openai_params=["tools"]` per request; the
     Agents SDK forwards it through ModelSettings.extra_args.
     """
-    if isinstance(model, str) and model.startswith("gpt-"):
+    if isinstance(model, str) and model.startswith(("gpt-5", "o1", "o3", "o4")):
         return ModelSettings(
             reasoning={"effort": "high", "summary": "detailed"},
             verbosity="high",
             include_usage=True,
         )
+    if isinstance(model, str) and model.startswith("gpt-"):
+        # Older OpenAI chat models reject the reasoning and verbosity settings.
+        return ModelSettings(include_usage=True)
     model_id = getattr(model, "model", "") if not isinstance(model, str) else ""
     if model_id.startswith("together_ai/"):
         return ModelSettings(extra_args={"allowed_openai_params": ["tools"]})
